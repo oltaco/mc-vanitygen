@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -O2
-TARGET = keygen
+TARGET = mc-vanitygen
 SRCS = main.c ed25519/ge.c ed25519/keypair.c ed25519/fe.c ed25519/sha512.c
 
 all: $(TARGET)
