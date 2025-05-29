@@ -4,7 +4,18 @@
 #include <string.h>
 #include <ctype.h>
 #include <getopt.h>
+#include <signal.h>
 #include "ed25519.h"
+
+// Global variable to handle SIGINT (Ctrl+C)
+volatile sig_atomic_t keep_running = 1;
+
+void signal_handler(int sig) {
+    if (sig == SIGINT) {
+        keep_running = 0;
+        printf("\nStopping search... (Ctrl+C detected)\n");
+    }
+}
 
 // RNG function required by ed25519.c
 void randombytes(unsigned char *x, size_t len) {
@@ -165,14 +176,15 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -s, --suffix    Match pattern as suffix\n");
     fprintf(stderr, "  -b, --both      Match pattern as both prefix and suffix\n");
     fprintf(stderr, "  -e, --either    Match pattern as prefix OR suffix OR both\n");
+    fprintf(stderr, "  -c, --continue  Keep finding matches until Ctrl+C (don't stop at first)\n");
     fprintf(stderr, "  -h, --help      Show this help message\n");
     fprintf(stderr, "\nExamples:\n");
     fprintf(stderr, "  %s deadbeef           # Find key with prefix 'deadbeef'\n", prog_name);
     fprintf(stderr, "  %s -s cafe            # Find key with suffix 'cafe'\n", prog_name);
     fprintf(stderr, "  %s -b abc             # Find key with both prefix and suffix 'abc'\n", prog_name);
     fprintf(stderr, "  %s -e abc             # Find key with 'abc' as prefix OR suffix OR both\n", prog_name);
-    fprintf(stderr, "  %s dead beef cafe     # Find key matching any of these prefixes\n", prog_name);
-    fprintf(stderr, "  %s -e dead beef       # Find key with 'dead' or 'beef' as prefix OR suffix OR both\n", prog_name);
+    fprintf(stderr, "  %s -c deadbeef        # Keep finding keys with prefix 'deadbeef' until Ctrl+C\n", prog_name);
+    fprintf(stderr, "  %s -e -c dead beef    # Keep finding keys with 'dead' or 'beef' as prefix OR suffix OR both\n", prog_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -180,6 +192,7 @@ int main(int argc, char *argv[]) {
     int match_suffix = 0;
     int match_both = 0;
     int match_either = 0;
+    int continue_search = 0;  // New option to keep searching
     int opt;
     
     static struct option long_options[] = {
@@ -187,11 +200,12 @@ int main(int argc, char *argv[]) {
         {"suffix", no_argument, 0, 's'},
         {"both", no_argument, 0, 'b'},
         {"either", no_argument, 0, 'e'},
+        {"continue", no_argument, 0, 'c'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
-    while ((opt = getopt_long(argc, argv, "psbeh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "psbech", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 match_prefix = 1;
@@ -216,6 +230,9 @@ int main(int argc, char *argv[]) {
                 match_suffix = 0;
                 match_both = 0;
                 match_either = 1;
+                break;
+            case 'c':
+                continue_search = 1;
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -266,33 +283,42 @@ int main(int argc, char *argv[]) {
     unsigned char public_key[32];
     unsigned char private_key[64];
     unsigned long attempts = 0;
+    unsigned long total_matches = 0;
     int matched_index = -1;
     int match_type = 0; // 1=prefix, 2=suffix, 3=both
     
+    // Set up signal handler for Ctrl+C
+    signal(SIGINT, signal_handler);
+    
     // Print what we're looking for
+    const char *mode_str;
     if (match_both) {
-        printf("Looking for public key with both prefix and suffix matching one of:\n");
-        for (int i = 0; i < num_patterns; i++) {
-            printf("  %s\n", patterns[i].hex_string);
-        }
+        mode_str = "both prefix and suffix";
     } else if (match_either) {
-        printf("Looking for public key with prefix OR suffix OR both matching one of:\n");
-        for (int i = 0; i < num_patterns; i++) {
-            printf("  %s\n", patterns[i].hex_string);
-        }
+        mode_str = "prefix OR suffix OR both";
     } else if (match_suffix) {
-        printf("Looking for public key ending with one of:\n");
-        for (int i = 0; i < num_patterns; i++) {
-            printf("  %s\n", patterns[i].hex_string);
-        }
+        mode_str = "suffix";
     } else {
-        printf("Looking for public key starting with one of:\n");
-        for (int i = 0; i < num_patterns; i++) {
-            printf("  %s\n", patterns[i].hex_string);
-        }
+        mode_str = "prefix";
+    }
+    
+    if (continue_search) {
+        printf("Continuously searching for public keys with %s matching one of:\n", mode_str);
+    } else {
+        printf("Looking for public key with %s matching one of:\n", mode_str);
+    }
+    
+    for (int i = 0; i < num_patterns; i++) {
+        printf("  %s\n", patterns[i].hex_string);
+    }
+    
+    if (continue_search) {
+        printf("Press Ctrl+C to stop the search.\n\n");
     }
     
     do {
+        if (!keep_running) break;  // Check if Ctrl+C was pressed
+        
         randombytes(seed, sizeof(seed));
         ed25519_create_keypair(public_key, private_key, seed);
         attempts++;
@@ -313,35 +339,51 @@ int main(int argc, char *argv[]) {
             match = check_multiple_prefix_match(public_key, patterns, num_patterns, &matched_index);
         }
         
-        if (match) break;
+        if (match) {
+            total_matches++;
+            
+            printf("\n=== MATCH #%lu found after %lu attempts ===\n", total_matches, attempts);
+            printf("Matched pattern: %s", patterns[matched_index].hex_string);
+            
+            if (match_either) {
+                switch (match_type) {
+                    case 1:
+                        printf(" (as prefix)");
+                        break;
+                    case 2:
+                        printf(" (as suffix)");
+                        break;
+                    case 3:
+                        printf(" (as both prefix and suffix)");
+                        break;
+                }
+            }
+            printf("\n");
+            
+            print_hex("Seed", seed, sizeof(seed));
+            print_hex("Public Key", public_key, sizeof(public_key));
+            print_hex("Private Key", private_key, sizeof(private_key));
+            printf("\n");
+            
+            if (!continue_search) break;  // Stop after first match if not in continuous mode
+        }
         
         // Optional: print progress every million attempts
         if (attempts % 1000000 == 0) {
-            printf("Attempts: %lu\n", attempts);
+            printf("Attempts: %lu, Matches found: %lu\n", attempts, total_matches);
         }
-    } while (1);
+    } while (keep_running);
     
-    printf("Found matching key after %lu attempts!\n", attempts);
-    printf("Matched pattern: %s", patterns[matched_index].hex_string);
-    
-    if (match_either) {
-        switch (match_type) {
-            case 1:
-                printf(" (as prefix)");
-                break;
-            case 2:
-                printf(" (as suffix)");
-                break;
-            case 3:
-                printf(" (as both prefix and suffix)");
-                break;
+    if (continue_search) {
+        printf("\n=== SEARCH SUMMARY ===\n");
+        printf("Total attempts: %lu\n", attempts);
+        printf("Total matches found: %lu\n", total_matches);
+        if (total_matches > 0) {
+            printf("Average attempts per match: %.1f\n", (double)attempts / total_matches);
         }
+    } else if (total_matches == 0) {
+        printf("No matches found after %lu attempts.\n", attempts);
     }
-    printf("\n");
-    
-    print_hex("Seed", seed, sizeof(seed));
-    print_hex("Public Key", public_key, sizeof(public_key));
-    print_hex("Private Key", private_key, sizeof(private_key));
     
     // Cleanup
     for (int i = 0; i < num_patterns; i++) {
