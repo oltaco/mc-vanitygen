@@ -55,7 +55,47 @@ int hexstr_to_bytes(const char *hexstr, unsigned char *buf, size_t bufsize, int 
     return (int)bytes_len;
 }
 
-// Check if public key matches prefix
+// Structure to hold pattern information
+typedef struct {
+    char *hex_string;
+    unsigned char *bytes;
+    int byte_len;
+    int half_byte;
+} pattern_t;
+
+// Check multiple patterns for prefix match
+int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+    for (int i = 0; i < num_patterns; i++) {
+        if (check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte)) {
+            *matched_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Check multiple patterns for suffix match
+int check_multiple_suffix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+    for (int i = 0; i < num_patterns; i++) {
+        if (check_suffix_match(public_key, patterns[i].hex_string)) {
+            *matched_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Check multiple patterns for both prefix and suffix match
+int check_multiple_both_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+    for (int i = 0; i < num_patterns; i++) {
+        if (check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte) &&
+            check_suffix_match(public_key, patterns[i].hex_string)) {
+            *matched_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
 int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes, 
                       int prefix_len, int half_byte) {
     for (int i = 0; i < prefix_len; i++) {
@@ -93,7 +133,7 @@ int check_suffix_match(const unsigned char *public_key, const char *hex_pattern)
 }
 
 void print_usage(const char *prog_name) {
-    fprintf(stderr, "Usage: %s [OPTIONS] <hex_pattern>\n", prog_name);
+    fprintf(stderr, "Usage: %s [OPTIONS] <hex_pattern1> [hex_pattern2] ...\n", prog_name);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -p, --prefix    Match pattern as prefix (default)\n");
     fprintf(stderr, "  -s, --suffix    Match pattern as suffix\n");
@@ -103,6 +143,8 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  %s deadbeef           # Find key with prefix 'deadbeef'\n", prog_name);
     fprintf(stderr, "  %s -s cafe            # Find key with suffix 'cafe'\n", prog_name);
     fprintf(stderr, "  %s -b abc             # Find key with both prefix and suffix 'abc'\n", prog_name);
+    fprintf(stderr, "  %s dead beef cafe     # Find key matching any of these prefixes\n", prog_name);
+    fprintf(stderr, "  %s -s dead beef       # Find key with suffix 'dead' OR 'beef'\n", prog_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -146,33 +188,63 @@ int main(int argc, char *argv[]) {
     }
     
     if (optind >= argc) {
-        fprintf(stderr, "Error: No hex pattern provided.\n");
+        fprintf(stderr, "Error: No hex patterns provided.\n");
         print_usage(argv[0]);
         return 1;
     }
     
-    const char *hex_pattern = argv[optind];
-    unsigned char pattern_bytes[32];
-    int half_byte = 0;
-    int pattern_len = hexstr_to_bytes(hex_pattern, pattern_bytes, sizeof(pattern_bytes), &half_byte);
-    
-    if (pattern_len <= 0) {
-        fprintf(stderr, "Invalid hex pattern provided.\n");
+    int num_patterns = argc - optind;
+    pattern_t *patterns = malloc(num_patterns * sizeof(pattern_t));
+    if (!patterns) {
+        fprintf(stderr, "Memory allocation failed.\n");
         return 1;
+    }
+    
+    // Parse all patterns
+    for (int i = 0; i < num_patterns; i++) {
+        const char *hex_pattern = argv[optind + i];
+        patterns[i].hex_string = strdup(hex_pattern);
+        if (!patterns[i].hex_string) {
+            fprintf(stderr, "Memory allocation failed.\n");
+            return 1;
+        }
+        
+        patterns[i].bytes = malloc(32);
+        if (!patterns[i].bytes) {
+            fprintf(stderr, "Memory allocation failed.\n");
+            return 1;
+        }
+        
+        patterns[i].byte_len = hexstr_to_bytes(hex_pattern, patterns[i].bytes, 32, &patterns[i].half_byte);
+        
+        if (patterns[i].byte_len <= 0) {
+            fprintf(stderr, "Invalid hex pattern provided: %s\n", hex_pattern);
+            return 1;
+        }
     }
     
     unsigned char seed[32];
     unsigned char public_key[32];
     unsigned char private_key[64];
     unsigned long attempts = 0;
+    int matched_index = -1;
     
     // Print what we're looking for
     if (match_both) {
-        printf("Looking for public key with both prefix and suffix: %s\n", hex_pattern);
+        printf("Looking for public key with both prefix and suffix matching one of:\n");
+        for (int i = 0; i < num_patterns; i++) {
+            printf("  %s\n", patterns[i].hex_string);
+        }
     } else if (match_suffix) {
-        printf("Looking for public key ending with: %s\n", hex_pattern);
+        printf("Looking for public key ending with one of:\n");
+        for (int i = 0; i < num_patterns; i++) {
+            printf("  %s\n", patterns[i].hex_string);
+        }
     } else {
-        printf("Looking for public key starting with: %s\n", hex_pattern);
+        printf("Looking for public key starting with one of:\n");
+        for (int i = 0; i < num_patterns; i++) {
+            printf("  %s\n", patterns[i].hex_string);
+        }
     }
     
     do {
@@ -184,14 +256,13 @@ int main(int argc, char *argv[]) {
         
         if (match_both) {
             // Must match both prefix and suffix
-            match = check_prefix_match(public_key, pattern_bytes, pattern_len, half_byte) &&
-                   check_suffix_match(public_key, hex_pattern);
+            match = check_multiple_both_match(public_key, patterns, num_patterns, &matched_index);
         } else if (match_suffix) {
             // Match suffix only
-            match = check_suffix_match(public_key, hex_pattern);
+            match = check_multiple_suffix_match(public_key, patterns, num_patterns, &matched_index);
         } else {
             // Match prefix only (default)
-            match = check_prefix_match(public_key, pattern_bytes, pattern_len, half_byte);
+            match = check_multiple_prefix_match(public_key, patterns, num_patterns, &matched_index);
         }
         
         if (match) break;
@@ -203,9 +274,17 @@ int main(int argc, char *argv[]) {
     } while (1);
     
     printf("Found matching key after %lu attempts!\n", attempts);
+    printf("Matched pattern: %s\n", patterns[matched_index].hex_string);
     print_hex("Seed", seed, sizeof(seed));
     print_hex("Public Key", public_key, sizeof(public_key));
     print_hex("Private Key", private_key, sizeof(private_key));
+    
+    // Cleanup
+    for (int i = 0; i < num_patterns; i++) {
+        free(patterns[i].hex_string);
+        free(patterns[i].bytes);
+    }
+    free(patterns);
     
     return 0;
 }
