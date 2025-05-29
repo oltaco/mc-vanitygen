@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <getopt.h>
 #include <signal.h>
+#include <time.h>
 #include "ed25519.h"
 
 // Global variable to handle SIGINT (Ctrl+C)
@@ -287,6 +288,11 @@ int main(int argc, char *argv[]) {
     int matched_index = -1;
     int match_type = 0; // 1=prefix, 2=suffix, 3=both
     
+    // Timing variables
+    time_t start_time = time(NULL);
+    time_t last_progress_time = start_time;
+    unsigned long last_progress_attempts = 0;
+    
     // Set up signal handler for Ctrl+C
     signal(SIGINT, signal_handler);
     
@@ -342,7 +348,14 @@ int main(int argc, char *argv[]) {
         if (match) {
             total_matches++;
             
+            time_t current_time = time(NULL);
+            double elapsed_time = difftime(current_time, start_time);
+            
             printf("\n=== MATCH #%lu found after %lu attempts ===\n", total_matches, attempts);
+            printf("Time elapsed: %.0f seconds\n", elapsed_time);
+            if (elapsed_time > 0) {
+                printf("Overall rate: %.1f attempts/second\n", attempts / elapsed_time);
+            }
             printf("Matched pattern: %s", patterns[matched_index].hex_string);
             
             if (match_either) {
@@ -368,21 +381,59 @@ int main(int argc, char *argv[]) {
             if (!continue_search) break;  // Stop after first match if not in continuous mode
         }
         
-        // Optional: print progress every million attempts
+        // Print progress every million attempts
         if (attempts % 1000000 == 0) {
-            printf("Attempts: %lu, Matches found: %lu\n", attempts, total_matches);
+            time_t current_time = time(NULL);
+            double total_elapsed = difftime(current_time, start_time);
+            double progress_elapsed = difftime(current_time, last_progress_time);
+            
+            unsigned long attempts_since_last = attempts - last_progress_attempts;
+            
+            printf("Attempts: %lu, Matches: %lu", attempts, total_matches);
+            
+            if (total_elapsed > 0) {
+                printf(", Overall: %.1f att/sec", attempts / total_elapsed);
+            }
+            
+            if (progress_elapsed > 0 && attempts_since_last > 0) {
+                printf(", Recent: %.1f att/sec", attempts_since_last / progress_elapsed);
+            }
+            
+            printf("\n");
+            
+            last_progress_time = current_time;
+            last_progress_attempts = attempts;
         }
     } while (keep_running);
     
     if (continue_search) {
+        time_t end_time = time(NULL);
+        double total_elapsed = difftime(end_time, start_time);
+        
         printf("\n=== SEARCH SUMMARY ===\n");
         printf("Total attempts: %lu\n", attempts);
         printf("Total matches found: %lu\n", total_matches);
+        printf("Total time: %.0f seconds\n", total_elapsed);
+        
+        if (total_elapsed > 0) {
+            printf("Average rate: %.1f attempts/second\n", attempts / total_elapsed);
+        }
+        
         if (total_matches > 0) {
             printf("Average attempts per match: %.1f\n", (double)attempts / total_matches);
+            if (total_elapsed > 0) {
+                printf("Average time per match: %.1f seconds\n", total_elapsed / total_matches);
+            }
         }
     } else if (total_matches == 0) {
-        printf("No matches found after %lu attempts.\n", attempts);
+        time_t end_time = time(NULL);
+        double total_elapsed = difftime(end_time, start_time);
+        
+        printf("No matches found after %lu attempts", attempts);
+        if (total_elapsed > 0) {
+            printf(" (%.1f attempts/second)", attempts / total_elapsed);
+        }
+        printf(".\n");
     }
     
     // Cleanup
