@@ -97,18 +97,46 @@ int check_multiple_suffix_match(const unsigned char *public_key, pattern_t *patt
     return 0;
 }
 
-// Enhanced "either" matching: checks prefix, suffix, AND both for each pattern
+// Enhanced "either" matching: checks prefix, suffix, AND cross-pattern combinations
 int check_multiple_either_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type) {
+    // First, check for same-pattern matches (prefix, suffix, or both for individual patterns)
     for (int i = 0; i < num_patterns; i++) {
         int prefix_match = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
         int suffix_match = check_suffix_match(public_key, patterns[i].hex_string);
         
         if (prefix_match && suffix_match) {
-            // Both prefix and suffix match - highest priority
+            // Both prefix and suffix match same pattern - highest priority
             *matched_index = i;
             *match_type = 3; // both
             return 1;
-        } else if (prefix_match) {
+        }
+    }
+    
+    // Second, check for cross-pattern matches (different patterns for prefix and suffix)
+    if (num_patterns > 1) {
+        for (int i = 0; i < num_patterns; i++) {
+            for (int j = 0; j < num_patterns; j++) {
+                if (i != j) { // Different patterns
+                    int prefix_match_i = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+                    int suffix_match_j = check_suffix_match(public_key, patterns[j].hex_string);
+                    
+                    if (prefix_match_i && suffix_match_j) {
+                        // Cross-pattern match: pattern i as prefix, pattern j as suffix
+                        *matched_index = i; // We'll report the prefix pattern as the matched one
+                        *match_type = 4; // cross-pattern match
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Third, check for single pattern matches (prefix only or suffix only)
+    for (int i = 0; i < num_patterns; i++) {
+        int prefix_match = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        int suffix_match = check_suffix_match(public_key, patterns[i].hex_string);
+        
+        if (prefix_match) {
             // Prefix only
             *matched_index = i;
             *match_type = 1; // prefix
@@ -120,6 +148,7 @@ int check_multiple_either_match(const unsigned char *public_key, pattern_t *patt
             return 1;
         }
     }
+    
     return 0;
 }
 
@@ -357,7 +386,6 @@ int main(int argc, char *argv[]) {
                 printf("Overall rate: %.1f attempts/second\n", attempts / elapsed_time);
             }
             printf("Matched pattern: %s", patterns[matched_index].hex_string);
-            
             if (match_either) {
                 switch (match_type) {
                     case 1:
@@ -369,10 +397,23 @@ int main(int argc, char *argv[]) {
                     case 3:
                         printf(" (as both prefix and suffix)");
                         break;
+                    case 4: {
+                        // For cross-pattern matches, we need to identify which pattern matched as suffix
+                        printf(" (as prefix, with ");
+                        // Find which pattern matched as suffix
+                        for (int k = 0; k < num_patterns; k++) {
+                            if (k != matched_index && check_suffix_match(public_key, patterns[k].hex_string)) {
+                                printf("%s as suffix", patterns[k].hex_string);
+                                break;
+                            }
+                        }
+                        printf(")");
+                        break;
+                    }
                 }
             }
             printf("\n");
-            
+ 
             print_hex("Seed", seed, sizeof(seed));
             print_hex("Public Key", public_key, sizeof(public_key));
             print_hex("Private Key", private_key, sizeof(private_key));
