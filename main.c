@@ -52,7 +52,6 @@ int hexstr_to_bytes(const char *hexstr, unsigned char *buf, size_t bufsize, int 
     *half_byte = (len % 2 == 1); // Odd number of characters?
     size_t bytes_len = (len + 1) / 2;
     if (bytes_len > bufsize) return -1;
-    
     for (size_t i = 0; i < bytes_len; i++) {
         int hi = hex_char_to_val(hexstr[2 * i]);
         int lo = 0;
@@ -73,7 +72,85 @@ typedef struct {
     unsigned char *bytes;
     int byte_len;
     int half_byte;
+    // New fields for optimized suffix matching
+    unsigned char *suffix_bytes;
+    int suffix_byte_len;
+    int suffix_half_byte;
 } pattern_t;
+
+// Function declarations
+int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes, int prefix_len, int half_byte);
+int check_suffix_match_optimized(const unsigned char *public_key, const pattern_t *pattern);
+int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
+int check_multiple_suffix_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
+int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
+int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type);
+
+int check_suffix_match_optimized(const unsigned char *public_key, const pattern_t *pattern) {
+    const int key_len = 32; // Ed25519 public keys are always 32 bytes
+    const char *hex_str = pattern->hex_string;
+    int hex_len = strlen(hex_str);
+    
+    if (hex_len > key_len * 2) {
+        return 0; // Pattern longer than key
+    }
+    
+    // Convert the suffix portion of the public key to hex string for comparison
+    // Calculate how many bytes from the end we need to check
+    int bytes_needed = (hex_len + 1) / 2;
+    int key_start = key_len - bytes_needed;
+    
+    // Convert the relevant bytes to hex string
+    char key_hex[65]; // 32 bytes * 2 + null terminator
+    for (int i = 0; i < bytes_needed; i++) {
+        sprintf(key_hex + i * 2, "%02x", public_key[key_start + i]);
+    }
+    
+    // For odd-length patterns, we need to compare from the right offset
+    if (hex_len % 2 == 1) {
+        // Odd length: compare starting from position 1 in the hex string
+        return (strncmp(key_hex + 1, hex_str, hex_len) == 0);
+    } else {
+        // Even length: compare from the beginning
+        return (strncmp(key_hex, hex_str, hex_len) == 0);
+    }
+}
+
+int preprocess_suffix_pattern(pattern_t *pattern) {
+    const char *hex_str = pattern->hex_string;
+    int hex_len = strlen(hex_str);
+    
+    pattern->suffix_half_byte = (hex_len % 2 == 1);
+    pattern->suffix_byte_len = (hex_len + 1) / 2;
+    
+    pattern->suffix_bytes = malloc(pattern->suffix_byte_len);
+    if (!pattern->suffix_bytes) {
+        return -1; // Memory allocation failed
+    }
+    
+    // For suffix matching, convert hex string directly from left to right
+    // The key insight: we'll handle the alignment during matching, not preprocessing
+    for (int i = 0; i < pattern->suffix_byte_len; i++) {
+        int hi_idx = 2 * i;
+        int lo_idx = 2 * i + 1;
+        
+        int hi = 0, lo = 0;
+        
+        if (hi_idx < hex_len) {
+            hi = hex_char_to_val(hex_str[hi_idx]);
+            if (hi < 0) return -1;
+        }
+        
+        if (lo_idx < hex_len) {
+            lo = hex_char_to_val(hex_str[lo_idx]);
+            if (lo < 0) return -1;
+        }
+        
+        pattern->suffix_bytes[i] = (hi << 4) | lo;
+    }
+    
+    return 0;
+}
 
 // Check multiple patterns for prefix match
 int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
@@ -86,10 +163,10 @@ int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patt
     return 0;
 }
 
-// Check multiple patterns for suffix match
-int check_multiple_suffix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+// Updated multiple suffix match function
+int check_multiple_suffix_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
     for (int i = 0; i < num_patterns; i++) {
-        if (check_suffix_match(public_key, patterns[i].hex_string)) {
+        if (check_suffix_match_optimized(public_key, &patterns[i])) {
             *matched_index = i;
             return 1;
         }
@@ -97,32 +174,58 @@ int check_multiple_suffix_match(const unsigned char *public_key, pattern_t *patt
     return 0;
 }
 
-// Enhanced "either" matching: checks prefix, suffix, AND cross-pattern combinations
-int check_multiple_either_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type) {
-    // First, check for same-pattern matches (prefix, suffix, or both for individual patterns)
+// Debug version to help identify the cross-pattern matching issue
+int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type) {
+    // First pass: collect all individual prefix and suffix matches
+    int prefix_matches[num_patterns];
+    int suffix_matches[num_patterns];
+    int num_prefix_matches = 0;
+    int num_suffix_matches = 0;
+    
+    // Check each pattern for both prefix and suffix matches
     for (int i = 0; i < num_patterns; i++) {
-        int prefix_match = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
-        int suffix_match = check_suffix_match(public_key, patterns[i].hex_string);
+        prefix_matches[i] = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        suffix_matches[i] = check_suffix_match_optimized(public_key, &patterns[i]);
         
-        if (prefix_match && suffix_match) {
-            // Both prefix and suffix match same pattern - highest priority
+        if (prefix_matches[i]) num_prefix_matches++;
+        if (suffix_matches[i]) num_suffix_matches++;
+    }
+    
+    // Debug: Print what we found (you can remove this after debugging)
+    // Uncomment these lines to see what matches are being detected:
+    /*
+    printf("DEBUG: Checking key: ");
+    for (int k = 0; k < 8; k++) printf("%02x", public_key[k]);
+    printf("...");
+    for (int k = 24; k < 32; k++) printf("%02x", public_key[k]);
+    printf("\n");
+    for (int i = 0; i < num_patterns; i++) {
+        printf("DEBUG: Pattern %d (%s): prefix=%d, suffix=%d\n", 
+               i, patterns[i].hex_string, prefix_matches[i], suffix_matches[i]);
+    }
+    printf("DEBUG: Total prefix matches: %d, suffix matches: %d\n", 
+           num_prefix_matches, num_suffix_matches);
+    */
+    
+    // Priority 1: Same-pattern both matches (prefix AND suffix for same pattern)
+    for (int i = 0; i < num_patterns; i++) {
+        if (prefix_matches[i] && suffix_matches[i]) {
             *matched_index = i;
             *match_type = 3; // both
             return 1;
         }
     }
     
-    // Second, check for cross-pattern matches (different patterns for prefix and suffix)
+    // Priority 2: Cross-pattern matches (different patterns for prefix and suffix)
+    // This is the key fix - we need to check if we have BOTH types of matches available
     if (num_patterns > 1) {
         for (int i = 0; i < num_patterns; i++) {
-            for (int j = 0; j < num_patterns; j++) {
-                if (i != j) { // Different patterns
-                    int prefix_match_i = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
-                    int suffix_match_j = check_suffix_match(public_key, patterns[j].hex_string);
-                    
-                    if (prefix_match_i && suffix_match_j) {
-                        // Cross-pattern match: pattern i as prefix, pattern j as suffix
-                        *matched_index = i; // We'll report the prefix pattern as the matched one
+            if (prefix_matches[i]) {
+                // Found a prefix match with pattern i, now look for suffix matches with other patterns
+                for (int j = 0; j < num_patterns; j++) {
+                    if (j != i && suffix_matches[j]) {
+                        // Found cross-pattern match: pattern i as prefix, pattern j as suffix
+                        *matched_index = i; // Report the prefix pattern as the matched one
                         *match_type = 4; // cross-pattern match
                         return 1;
                     }
@@ -131,18 +234,18 @@ int check_multiple_either_match(const unsigned char *public_key, pattern_t *patt
         }
     }
     
-    // Third, check for single pattern matches (prefix only or suffix only)
+    // Priority 3: Single matches (prefix only or suffix only)
+    // Prefer prefix matches if both exist
     for (int i = 0; i < num_patterns; i++) {
-        int prefix_match = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
-        int suffix_match = check_suffix_match(public_key, patterns[i].hex_string);
-        
-        if (prefix_match) {
-            // Prefix only
+        if (prefix_matches[i]) {
             *matched_index = i;
             *match_type = 1; // prefix
             return 1;
-        } else if (suffix_match) {
-            // Suffix only
+        }
+    }
+    
+    for (int i = 0; i < num_patterns; i++) {
+        if (suffix_matches[i]) {
             *matched_index = i;
             *match_type = 2; // suffix
             return 1;
@@ -152,10 +255,61 @@ int check_multiple_either_match(const unsigned char *public_key, pattern_t *patt
     return 0;
 }
 
-int check_multiple_both_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+// Also, let's make sure the cross-pattern match reporting is correct in main()
+// The relevant part in main() should look like this:
+/*
+if (match) {
+    total_matches++;
+    time_t current_time = time(NULL);
+    double elapsed_time = difftime(current_time, start_time);
+    
+    printf("\n=== MATCH #%lu found after %lu attempts ===\n", total_matches, attempts);
+    printf("Time elapsed: %.0f seconds\n", elapsed_time);
+    if (elapsed_time > 0) {
+        printf("Overall rate: %.1f attempts/second\n", attempts / elapsed_time);
+    }
+    
+    printf("Matched pattern: %s", patterns[matched_index].hex_string);
+    if (match_either) {
+        switch (match_type) {
+            case 1:
+                printf(" (as prefix)");
+                break;
+            case 2:
+                printf(" (as suffix)");
+                break;
+            case 3:
+                printf(" (as both prefix and suffix)");
+                break;
+            case 4: {
+                // For cross-pattern matches, find which pattern matched as suffix
+                printf(" (as prefix, with ");
+                for (int k = 0; k < num_patterns; k++) {
+                    if (k != matched_index && check_suffix_match_optimized(public_key, &patterns[k])) {
+                        printf("%s as suffix", patterns[k].hex_string);
+                        break;
+                    }
+                }
+                printf(")");
+                break;
+            }
+        }
+    }
+    printf("\n");
+    
+    print_hex("Seed", seed, sizeof(seed));
+    print_hex("Public Key", public_key, sizeof(public_key));
+    print_hex("Private Key", private_key, sizeof(private_key));
+    printf("\n");
+    
+    if (!continue_search) break;
+}
+*/
+
+int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
     for (int i = 0; i < num_patterns; i++) {
         if (check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte) &&
-            check_suffix_match(public_key, patterns[i].hex_string)) {
+            check_suffix_match_optimized(public_key, &patterns[i])) {
             *matched_index = i;
             return 1;
         }
@@ -163,7 +317,7 @@ int check_multiple_both_match(const unsigned char *public_key, pattern_t *patter
     return 0;
 }
 
-int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes, 
+int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes,
                       int prefix_len, int half_byte) {
     for (int i = 0; i < prefix_len; i++) {
         if (i == prefix_len - 1 && half_byte) {
@@ -180,23 +334,14 @@ int check_prefix_match(const unsigned char *public_key, const unsigned char *pre
     return 1;
 }
 
-// Check if public key matches suffix
-int check_suffix_match(const unsigned char *public_key, const char *hex_pattern) {
-    int key_len = 32; // Ed25519 public keys are always 32 bytes
-    int pattern_len = strlen(hex_pattern);
-    
-    // Convert the end of the public key to hex string
-    char key_hex[65]; // 32 bytes * 2 + null terminator
-    for (int i = 0; i < key_len; i++) {
-        sprintf(key_hex + i * 2, "%02x", public_key[i]);
+// Memory cleanup function
+void cleanup_patterns(pattern_t *patterns, int num_patterns) {
+    for (int i = 0; i < num_patterns; i++) {
+        free(patterns[i].hex_string);
+        free(patterns[i].bytes);
+        free(patterns[i].suffix_bytes);
     }
-    key_hex[64] = '\0';
-    
-    // Check if the key ends with the pattern
-    if (pattern_len > 64) return 0; // Pattern too long
-    
-    int key_suffix_start = 64 - pattern_len;
-    return (strncmp(key_hex + key_suffix_start, hex_pattern, pattern_len) == 0);
+    free(patterns);
 }
 
 void print_usage(const char *prog_name) {
@@ -215,6 +360,7 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  %s -e abc             # Find key with 'abc' as prefix OR suffix OR both\n", prog_name);
     fprintf(stderr, "  %s -c deadbeef        # Keep finding keys with prefix 'deadbeef' until Ctrl+C\n", prog_name);
     fprintf(stderr, "  %s -e -c dead beef    # Keep finding keys with 'dead' or 'beef' as prefix OR suffix OR both\n", prog_name);
+    fprintf(stderr, "  %s -e abc def         # Find key with 'abc' or 'def' as prefix/suffix, including cross-matches\n", prog_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -292,19 +438,28 @@ int main(int argc, char *argv[]) {
         patterns[i].hex_string = strdup(hex_pattern);
         if (!patterns[i].hex_string) {
             fprintf(stderr, "Memory allocation failed.\n");
+            cleanup_patterns(patterns, i);
             return 1;
         }
         
+        // Initialize prefix matching data
         patterns[i].bytes = malloc(32);
         if (!patterns[i].bytes) {
             fprintf(stderr, "Memory allocation failed.\n");
+            cleanup_patterns(patterns, i + 1);
+            return 1;
+        }
+        patterns[i].byte_len = hexstr_to_bytes(hex_pattern, patterns[i].bytes, 32, &patterns[i].half_byte);
+        if (patterns[i].byte_len <= 0) {
+            fprintf(stderr, "Invalid hex pattern provided: %s\n", hex_pattern);
+            cleanup_patterns(patterns, i + 1);
             return 1;
         }
         
-        patterns[i].byte_len = hexstr_to_bytes(hex_pattern, patterns[i].bytes, 32, &patterns[i].half_byte);
-        
-        if (patterns[i].byte_len <= 0) {
-            fprintf(stderr, "Invalid hex pattern provided: %s\n", hex_pattern);
+        // Initialize suffix matching data
+        if (preprocess_suffix_pattern(&patterns[i]) < 0) {
+            fprintf(stderr, "Failed to preprocess suffix pattern: %s\n", hex_pattern);
+            cleanup_patterns(patterns, i + 1);
             return 1;
         }
     }
@@ -315,7 +470,7 @@ int main(int argc, char *argv[]) {
     unsigned long attempts = 0;
     unsigned long total_matches = 0;
     int matched_index = -1;
-    int match_type = 0; // 1=prefix, 2=suffix, 3=both
+    int match_type = 0; // 1=prefix, 2=suffix, 3=both, 4=cross-pattern
     
     // Timing variables
     time_t start_time = time(NULL);
@@ -330,7 +485,7 @@ int main(int argc, char *argv[]) {
     if (match_both) {
         mode_str = "both prefix and suffix";
     } else if (match_either) {
-        mode_str = "prefix OR suffix OR both";
+        mode_str = "prefix OR suffix OR both (including cross-pattern matches)";
     } else if (match_suffix) {
         mode_str = "suffix";
     } else {
@@ -342,11 +497,9 @@ int main(int argc, char *argv[]) {
     } else {
         printf("Looking for public key with %s matching one of:\n", mode_str);
     }
-    
     for (int i = 0; i < num_patterns; i++) {
         printf("  %s\n", patterns[i].hex_string);
     }
-    
     if (continue_search) {
         printf("Press Ctrl+C to stop the search.\n\n");
     }
@@ -359,16 +512,15 @@ int main(int argc, char *argv[]) {
         attempts++;
         
         int match = 0;
-        
         if (match_both) {
             // Must match both prefix and suffix
-            match = check_multiple_both_match(public_key, patterns, num_patterns, &matched_index);
+            match = check_multiple_both_match_optimized(public_key, patterns, num_patterns, &matched_index);
         } else if (match_either) {
-            // Match prefix OR suffix OR both
-            match = check_multiple_either_match(public_key, patterns, num_patterns, &matched_index, &match_type);
+            // Match prefix OR suffix OR both OR cross-pattern
+            match = check_multiple_either_match_optimized(public_key, patterns, num_patterns, &matched_index, &match_type);
         } else if (match_suffix) {
             // Match suffix only
-            match = check_multiple_suffix_match(public_key, patterns, num_patterns, &matched_index);
+            match = check_multiple_suffix_match_optimized(public_key, patterns, num_patterns, &matched_index);
         } else {
             // Match prefix only (default)
             match = check_multiple_prefix_match(public_key, patterns, num_patterns, &matched_index);
@@ -376,7 +528,6 @@ int main(int argc, char *argv[]) {
         
         if (match) {
             total_matches++;
-            
             time_t current_time = time(NULL);
             double elapsed_time = difftime(current_time, start_time);
             
@@ -385,6 +536,7 @@ int main(int argc, char *argv[]) {
             if (elapsed_time > 0) {
                 printf("Overall rate: %.1f attempts/second\n", attempts / elapsed_time);
             }
+            
             printf("Matched pattern: %s", patterns[matched_index].hex_string);
             if (match_either) {
                 switch (match_type) {
@@ -402,7 +554,7 @@ int main(int argc, char *argv[]) {
                         printf(" (as prefix, with ");
                         // Find which pattern matched as suffix
                         for (int k = 0; k < num_patterns; k++) {
-                            if (k != matched_index && check_suffix_match(public_key, patterns[k].hex_string)) {
+                            if (k != matched_index && check_suffix_match_optimized(public_key, &patterns[k])) {
                                 printf("%s as suffix", patterns[k].hex_string);
                                 break;
                             }
@@ -413,7 +565,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             printf("\n");
- 
+            
             print_hex("Seed", seed, sizeof(seed));
             print_hex("Public Key", public_key, sizeof(public_key));
             print_hex("Private Key", private_key, sizeof(private_key));
@@ -427,19 +579,15 @@ int main(int argc, char *argv[]) {
             time_t current_time = time(NULL);
             double total_elapsed = difftime(current_time, start_time);
             double progress_elapsed = difftime(current_time, last_progress_time);
-            
             unsigned long attempts_since_last = attempts - last_progress_attempts;
             
             printf("Attempts: %lu, Matches: %lu", attempts, total_matches);
-            
             if (total_elapsed > 0) {
                 printf(", Overall: %.1f att/sec", attempts / total_elapsed);
             }
-            
             if (progress_elapsed > 0 && attempts_since_last > 0) {
                 printf(", Recent: %.1f att/sec", attempts_since_last / progress_elapsed);
             }
-            
             printf("\n");
             
             last_progress_time = current_time;
@@ -450,16 +598,13 @@ int main(int argc, char *argv[]) {
     if (continue_search) {
         time_t end_time = time(NULL);
         double total_elapsed = difftime(end_time, start_time);
-        
         printf("\n=== SEARCH SUMMARY ===\n");
         printf("Total attempts: %lu\n", attempts);
         printf("Total matches found: %lu\n", total_matches);
         printf("Total time: %.0f seconds\n", total_elapsed);
-        
         if (total_elapsed > 0) {
             printf("Average rate: %.1f attempts/second\n", attempts / total_elapsed);
         }
-        
         if (total_matches > 0) {
             printf("Average attempts per match: %.1f\n", (double)attempts / total_matches);
             if (total_elapsed > 0) {
@@ -469,7 +614,6 @@ int main(int argc, char *argv[]) {
     } else if (total_matches == 0) {
         time_t end_time = time(NULL);
         double total_elapsed = difftime(end_time, start_time);
-        
         printf("No matches found after %lu attempts", attempts);
         if (total_elapsed > 0) {
             printf(" (%.1f attempts/second)", attempts / total_elapsed);
@@ -478,11 +622,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Cleanup
-    for (int i = 0; i < num_patterns; i++) {
-        free(patterns[i].hex_string);
-        free(patterns[i].bytes);
-    }
-    free(patterns);
+    cleanup_patterns(patterns, num_patterns);
     
     return 0;
 }
