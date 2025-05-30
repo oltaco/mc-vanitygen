@@ -533,21 +533,27 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Progress reporting thread
+    // Progress reporting with shorter sleep intervals
+    int report_counter = 0;
     while (keep_running && (!match_found || continue_search)) {
-        sleep(10); // Report every 10 seconds
+        usleep(500000); // Sleep for 0.5 seconds instead of 10 seconds
+        report_counter++;
         
-        pthread_mutex_lock(&stats_mutex);
-        unsigned long current_attempts = total_attempts;
-        unsigned long current_matches = total_matches;
-        pthread_mutex_unlock(&stats_mutex);
-        
-        time_t current_time = time(NULL);
-        double elapsed = difftime(current_time, start_time);
-        
-        if (elapsed > 0) {
-            printf("Progress: %lu attempts, %lu matches, %.1f att/sec (%.1f sec elapsed)\n",
-                   current_attempts, current_matches, current_attempts / elapsed, elapsed);
+        // Only report progress every 20 iterations (10 seconds total)
+        if (report_counter >= 20) {
+            pthread_mutex_lock(&stats_mutex);
+            unsigned long current_attempts = total_attempts;
+            unsigned long current_matches = total_matches;
+            pthread_mutex_unlock(&stats_mutex);
+            
+            time_t current_time = time(NULL);
+            double elapsed = difftime(current_time, start_time);
+            
+            if (elapsed > 0) {
+                printf("Progress: %lu attempts, %lu matches, %.1f att/sec (%.1f sec elapsed)\n",
+                       current_attempts, current_matches, current_attempts / elapsed, elapsed);
+            }
+            report_counter = 0;
         }
     }
     
