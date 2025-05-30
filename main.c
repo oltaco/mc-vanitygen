@@ -6,10 +6,20 @@
 #include <getopt.h>
 #include <signal.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "ed25519.h"
 
-// Global variable to handle SIGINT (Ctrl+C)
+// Global variables for thread coordination
 volatile sig_atomic_t keep_running = 1;
+volatile sig_atomic_t match_found = 0;
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Global statistics
+unsigned long total_attempts = 0;
+unsigned long total_matches = 0;
+time_t start_time;
 
 void signal_handler(int sig) {
     if (sig == SIGINT) {
@@ -29,7 +39,7 @@ void randombytes(unsigned char *x, size_t len) {
     fclose(fp);
 }
 
-// Print bytes as hex
+// Print bytes as hex (thread-safe version)
 void print_hex(const char *label, const unsigned char *data, size_t len) {
     printf("%s: ", label);
     for (size_t i = 0; i < len; i++) {
@@ -46,10 +56,10 @@ int hex_char_to_val(char c) {
     return -1;
 }
 
-// Convert hex string to bytes. Returns number of bytes, sets half_byte flag if needed.
+// Convert hex string to bytes
 int hexstr_to_bytes(const char *hexstr, unsigned char *buf, size_t bufsize, int *half_byte) {
     size_t len = strlen(hexstr);
-    *half_byte = (len % 2 == 1); // Odd number of characters?
+    *half_byte = (len % 2 == 1);
     size_t bytes_len = (len + 1) / 2;
     if (bytes_len > bufsize) return -1;
     for (size_t i = 0; i < bytes_len; i++) {
@@ -58,7 +68,7 @@ int hexstr_to_bytes(const char *hexstr, unsigned char *buf, size_t bufsize, int 
         if ((2 * i + 1) < len) {
             lo = hex_char_to_val(hexstr[2 * i + 1]);
         } else {
-            lo = -1; // Indicates half-byte at end
+            lo = -1;
         }
         if (hi < 0 || (lo < 0 && !*half_byte)) return -1;
         buf[i] = (hi << 4) | ((lo >= 0) ? lo : 0);
@@ -72,13 +82,23 @@ typedef struct {
     unsigned char *bytes;
     int byte_len;
     int half_byte;
-    // New fields for optimized suffix matching
     unsigned char *suffix_bytes;
     int suffix_byte_len;
     int suffix_half_byte;
 } pattern_t;
 
-// Function declarations
+// Thread data structure
+typedef struct {
+    int thread_id;
+    pattern_t *patterns;
+    int num_patterns;
+    int match_mode; // 1=prefix, 2=suffix, 3=both, 4=either
+    int continue_search;
+    unsigned long local_attempts;
+    unsigned long local_matches;
+} thread_data_t;
+
+// Forward declarations
 int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes, int prefix_len, int half_byte);
 int check_suffix_match_optimized(const unsigned char *public_key, const pattern_t *pattern);
 int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
@@ -86,36 +106,7 @@ int check_multiple_suffix_match_optimized(const unsigned char *public_key, patte
 int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
 int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type);
 
-int check_suffix_match_optimized(const unsigned char *public_key, const pattern_t *pattern) {
-    const int key_len = 32; // Ed25519 public keys are always 32 bytes
-    const char *hex_str = pattern->hex_string;
-    int hex_len = strlen(hex_str);
-    
-    if (hex_len > key_len * 2) {
-        return 0; // Pattern longer than key
-    }
-    
-    // Convert the suffix portion of the public key to hex string for comparison
-    // Calculate how many bytes from the end we need to check
-    int bytes_needed = (hex_len + 1) / 2;
-    int key_start = key_len - bytes_needed;
-    
-    // Convert the relevant bytes to hex string
-    char key_hex[65]; // 32 bytes * 2 + null terminator
-    for (int i = 0; i < bytes_needed; i++) {
-        sprintf(key_hex + i * 2, "%02x", public_key[key_start + i]);
-    }
-    
-    // For odd-length patterns, we need to compare from the right offset
-    if (hex_len % 2 == 1) {
-        // Odd length: compare starting from position 1 in the hex string
-        return (strncmp(key_hex + 1, hex_str, hex_len) == 0);
-    } else {
-        // Even length: compare from the beginning
-        return (strncmp(key_hex, hex_str, hex_len) == 0);
-    }
-}
-
+// Suffix matching functions (same as before)
 int preprocess_suffix_pattern(pattern_t *pattern) {
     const char *hex_str = pattern->hex_string;
     int hex_len = strlen(hex_str);
@@ -125,11 +116,9 @@ int preprocess_suffix_pattern(pattern_t *pattern) {
     
     pattern->suffix_bytes = malloc(pattern->suffix_byte_len);
     if (!pattern->suffix_bytes) {
-        return -1; // Memory allocation failed
+        return -1;
     }
     
-    // For suffix matching, convert hex string directly from left to right
-    // The key insight: we'll handle the alignment during matching, not preprocessing
     for (int i = 0; i < pattern->suffix_byte_len; i++) {
         int hi_idx = 2 * i;
         int lo_idx = 2 * i + 1;
@@ -152,7 +141,47 @@ int preprocess_suffix_pattern(pattern_t *pattern) {
     return 0;
 }
 
-// Check multiple patterns for prefix match
+int check_suffix_match_optimized(const unsigned char *public_key, const pattern_t *pattern) {
+    const int key_len = 32;
+    const char *hex_str = pattern->hex_string;
+    int hex_len = strlen(hex_str);
+    
+    if (hex_len > key_len * 2) {
+        return 0;
+    }
+    
+    int bytes_needed = (hex_len + 1) / 2;
+    int key_start = key_len - bytes_needed;
+    
+    char key_hex[65];
+    for (int i = 0; i < bytes_needed; i++) {
+        sprintf(key_hex + i * 2, "%02x", public_key[key_start + i]);
+    }
+    
+    if (hex_len % 2 == 1) {
+        return (strncmp(key_hex + 1, hex_str, hex_len) == 0);
+    } else {
+        return (strncmp(key_hex, hex_str, hex_len) == 0);
+    }
+}
+
+// All the matching functions (same as before)
+int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes,
+                      int prefix_len, int half_byte) {
+    for (int i = 0; i < prefix_len; i++) {
+        if (i == prefix_len - 1 && half_byte) {
+            if ((public_key[i] >> 4) != (prefix_bytes[i] >> 4)) {
+                return 0;
+            }
+        } else {
+            if (public_key[i] != prefix_bytes[i]) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
     for (int i = 0; i < num_patterns; i++) {
         if (check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte)) {
@@ -163,7 +192,6 @@ int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patt
     return 0;
 }
 
-// Updated multiple suffix match function
 int check_multiple_suffix_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
     for (int i = 0; i < num_patterns; i++) {
         if (check_suffix_match_optimized(public_key, &patterns[i])) {
@@ -173,138 +201,6 @@ int check_multiple_suffix_match_optimized(const unsigned char *public_key, patte
     }
     return 0;
 }
-
-// Debug version to help identify the cross-pattern matching issue
-int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type) {
-    // First pass: collect all individual prefix and suffix matches
-    int prefix_matches[num_patterns];
-    int suffix_matches[num_patterns];
-    int num_prefix_matches = 0;
-    int num_suffix_matches = 0;
-    
-    // Check each pattern for both prefix and suffix matches
-    for (int i = 0; i < num_patterns; i++) {
-        prefix_matches[i] = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
-        suffix_matches[i] = check_suffix_match_optimized(public_key, &patterns[i]);
-        
-        if (prefix_matches[i]) num_prefix_matches++;
-        if (suffix_matches[i]) num_suffix_matches++;
-    }
-    
-    // Debug: Print what we found (you can remove this after debugging)
-    // Uncomment these lines to see what matches are being detected:
-    /*
-    printf("DEBUG: Checking key: ");
-    for (int k = 0; k < 8; k++) printf("%02x", public_key[k]);
-    printf("...");
-    for (int k = 24; k < 32; k++) printf("%02x", public_key[k]);
-    printf("\n");
-    for (int i = 0; i < num_patterns; i++) {
-        printf("DEBUG: Pattern %d (%s): prefix=%d, suffix=%d\n", 
-               i, patterns[i].hex_string, prefix_matches[i], suffix_matches[i]);
-    }
-    printf("DEBUG: Total prefix matches: %d, suffix matches: %d\n", 
-           num_prefix_matches, num_suffix_matches);
-    */
-    
-    // Priority 1: Same-pattern both matches (prefix AND suffix for same pattern)
-    for (int i = 0; i < num_patterns; i++) {
-        if (prefix_matches[i] && suffix_matches[i]) {
-            *matched_index = i;
-            *match_type = 3; // both
-            return 1;
-        }
-    }
-    
-    // Priority 2: Cross-pattern matches (different patterns for prefix and suffix)
-    // This is the key fix - we need to check if we have BOTH types of matches available
-    if (num_patterns > 1) {
-        for (int i = 0; i < num_patterns; i++) {
-            if (prefix_matches[i]) {
-                // Found a prefix match with pattern i, now look for suffix matches with other patterns
-                for (int j = 0; j < num_patterns; j++) {
-                    if (j != i && suffix_matches[j]) {
-                        // Found cross-pattern match: pattern i as prefix, pattern j as suffix
-                        *matched_index = i; // Report the prefix pattern as the matched one
-                        *match_type = 4; // cross-pattern match
-                        return 1;
-                    }
-                }
-            }
-        }
-    }
-    
-    // Priority 3: Single matches (prefix only or suffix only)
-    // Prefer prefix matches if both exist
-    for (int i = 0; i < num_patterns; i++) {
-        if (prefix_matches[i]) {
-            *matched_index = i;
-            *match_type = 1; // prefix
-            return 1;
-        }
-    }
-    
-    for (int i = 0; i < num_patterns; i++) {
-        if (suffix_matches[i]) {
-            *matched_index = i;
-            *match_type = 2; // suffix
-            return 1;
-        }
-    }
-    
-    return 0;
-}
-
-// Also, let's make sure the cross-pattern match reporting is correct in main()
-// The relevant part in main() should look like this:
-/*
-if (match) {
-    total_matches++;
-    time_t current_time = time(NULL);
-    double elapsed_time = difftime(current_time, start_time);
-    
-    printf("\n=== MATCH #%lu found after %lu attempts ===\n", total_matches, attempts);
-    printf("Time elapsed: %.0f seconds\n", elapsed_time);
-    if (elapsed_time > 0) {
-        printf("Overall rate: %.1f attempts/second\n", attempts / elapsed_time);
-    }
-    
-    printf("Matched pattern: %s", patterns[matched_index].hex_string);
-    if (match_either) {
-        switch (match_type) {
-            case 1:
-                printf(" (as prefix)");
-                break;
-            case 2:
-                printf(" (as suffix)");
-                break;
-            case 3:
-                printf(" (as both prefix and suffix)");
-                break;
-            case 4: {
-                // For cross-pattern matches, find which pattern matched as suffix
-                printf(" (as prefix, with ");
-                for (int k = 0; k < num_patterns; k++) {
-                    if (k != matched_index && check_suffix_match_optimized(public_key, &patterns[k])) {
-                        printf("%s as suffix", patterns[k].hex_string);
-                        break;
-                    }
-                }
-                printf(")");
-                break;
-            }
-        }
-    }
-    printf("\n");
-    
-    print_hex("Seed", seed, sizeof(seed));
-    print_hex("Public Key", public_key, sizeof(public_key));
-    print_hex("Private Key", private_key, sizeof(private_key));
-    printf("\n");
-    
-    if (!continue_search) break;
-}
-*/
 
 int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
     for (int i = 0; i < num_patterns; i++) {
@@ -317,21 +213,159 @@ int check_multiple_both_match_optimized(const unsigned char *public_key, pattern
     return 0;
 }
 
-int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes,
-                      int prefix_len, int half_byte) {
-    for (int i = 0; i < prefix_len; i++) {
-        if (i == prefix_len - 1 && half_byte) {
-            // Only compare high nibble
-            if ((public_key[i] >> 4) != (prefix_bytes[i] >> 4)) {
-                return 0;
-            }
-        } else {
-            if (public_key[i] != prefix_bytes[i]) {
-                return 0;
+int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type) {
+    int prefix_matches[num_patterns];
+    int suffix_matches[num_patterns];
+    
+    for (int i = 0; i < num_patterns; i++) {
+        prefix_matches[i] = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        suffix_matches[i] = check_suffix_match_optimized(public_key, &patterns[i]);
+    }
+    
+    // Priority 1: Same-pattern both matches
+    for (int i = 0; i < num_patterns; i++) {
+        if (prefix_matches[i] && suffix_matches[i]) {
+            *matched_index = i;
+            *match_type = 3;
+            return 1;
+        }
+    }
+    
+    // Priority 2: Cross-pattern matches
+    if (num_patterns > 1) {
+        for (int i = 0; i < num_patterns; i++) {
+            if (prefix_matches[i]) {
+                for (int j = 0; j < num_patterns; j++) {
+                    if (j != i && suffix_matches[j]) {
+                        *matched_index = i;
+                        *match_type = 4;
+                        return 1;
+                    }
+                }
             }
         }
     }
-    return 1;
+    
+    // Priority 3: Single matches
+    for (int i = 0; i < num_patterns; i++) {
+        if (prefix_matches[i]) {
+            *matched_index = i;
+            *match_type = 1;
+            return 1;
+        }
+    }
+    
+    for (int i = 0; i < num_patterns; i++) {
+        if (suffix_matches[i]) {
+            *matched_index = i;
+            *match_type = 2;
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+// Thread function
+void* worker_thread(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+    unsigned char seed[32];
+    unsigned char public_key[32];
+    unsigned char private_key[64];
+    int matched_index = -1;
+    int match_type = 0;
+    
+    data->local_attempts = 0;
+    data->local_matches = 0;
+    
+    while (keep_running && (!match_found || data->continue_search)) {
+        randombytes(seed, sizeof(seed));
+        ed25519_create_keypair(public_key, private_key, seed);
+        data->local_attempts++;
+        
+        int match = 0;
+        if (data->match_mode == 1) { // prefix
+            match = check_multiple_prefix_match(public_key, data->patterns, data->num_patterns, &matched_index);
+        } else if (data->match_mode == 2) { // suffix
+            match = check_multiple_suffix_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index);
+        } else if (data->match_mode == 3) { // both
+            match = check_multiple_both_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index);
+        } else if (data->match_mode == 4) { // either
+            match = check_multiple_either_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index, &match_type);
+        }
+        
+        if (match) {
+            pthread_mutex_lock(&print_mutex);
+            
+            // Update global stats
+            pthread_mutex_lock(&stats_mutex);
+            total_matches++;
+            unsigned long current_total_matches = total_matches;
+            pthread_mutex_unlock(&stats_mutex);
+            
+            data->local_matches++;
+            
+            time_t current_time = time(NULL);
+            double elapsed_time = difftime(current_time, start_time);
+            
+            printf("\n=== MATCH #%lu found by thread %d after %lu local attempts ===\n", 
+                   current_total_matches, data->thread_id, data->local_attempts);
+            printf("Time elapsed: %.0f seconds\n", elapsed_time);
+            
+            printf("Matched pattern: %s", data->patterns[matched_index].hex_string);
+            if (data->match_mode == 4) { // either mode
+                switch (match_type) {
+                    case 1:
+                        printf(" (as prefix)");
+                        break;
+                    case 2:
+                        printf(" (as suffix)");
+                        break;
+                    case 3:
+                        printf(" (as both prefix and suffix)");
+                        break;
+                    case 4: {
+                        printf(" (as prefix, with ");
+                        for (int k = 0; k < data->num_patterns; k++) {
+                            if (k != matched_index && check_suffix_match_optimized(public_key, &data->patterns[k])) {
+                                printf("%s as suffix", data->patterns[k].hex_string);
+                                break;
+                            }
+                        }
+                        printf(")");
+                        break;
+                    }
+                }
+            }
+            printf("\n");
+            
+            print_hex("Seed", seed, sizeof(seed));
+            print_hex("Public Key", public_key, sizeof(public_key));
+            print_hex("Private Key", private_key, sizeof(private_key));
+            printf("\n");
+            
+            pthread_mutex_unlock(&print_mutex);
+            
+            if (!data->continue_search) {
+                match_found = 1;
+                break;
+            }
+        }
+        
+        // Update global stats periodically
+        if (data->local_attempts % 100000 == 0) {
+            pthread_mutex_lock(&stats_mutex);
+            total_attempts += 100000;
+            pthread_mutex_unlock(&stats_mutex);
+        }
+    }
+    
+    // Final stats update
+    pthread_mutex_lock(&stats_mutex);
+    total_attempts += data->local_attempts % 100000;
+    pthread_mutex_unlock(&stats_mutex);
+    
+    return NULL;
 }
 
 // Memory cleanup function
@@ -352,23 +386,17 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -b, --both      Match pattern as both prefix and suffix\n");
     fprintf(stderr, "  -e, --either    Match pattern as prefix OR suffix OR both\n");
     fprintf(stderr, "  -c, --continue  Keep finding matches until Ctrl+C (don't stop at first)\n");
+    fprintf(stderr, "  -t, --threads   Number of threads to use (default: number of CPU cores)\n");
     fprintf(stderr, "  -h, --help      Show this help message\n");
-    fprintf(stderr, "\nExamples:\n");
-    fprintf(stderr, "  %s deadbeef           # Find key with prefix 'deadbeef'\n", prog_name);
-    fprintf(stderr, "  %s -s cafe            # Find key with suffix 'cafe'\n", prog_name);
-    fprintf(stderr, "  %s -b abc             # Find key with both prefix and suffix 'abc'\n", prog_name);
-    fprintf(stderr, "  %s -e abc             # Find key with 'abc' as prefix OR suffix OR both\n", prog_name);
-    fprintf(stderr, "  %s -c deadbeef        # Keep finding keys with prefix 'deadbeef' until Ctrl+C\n", prog_name);
-    fprintf(stderr, "  %s -e -c dead beef    # Keep finding keys with 'dead' or 'beef' as prefix OR suffix OR both\n", prog_name);
-    fprintf(stderr, "  %s -e abc def         # Find key with 'abc' or 'def' as prefix/suffix, including cross-matches\n", prog_name);
 }
 
 int main(int argc, char *argv[]) {
-    int match_prefix = 1;  // Default to prefix matching
+    int match_prefix = 1;
     int match_suffix = 0;
     int match_both = 0;
     int match_either = 0;
-    int continue_search = 0;  // New option to keep searching
+    int continue_search = 0;
+    int num_threads = sysconf(_SC_NPROCESSORS_ONLN); // Default to number of CPU cores
     int opt;
     
     static struct option long_options[] = {
@@ -377,38 +405,34 @@ int main(int argc, char *argv[]) {
         {"both", no_argument, 0, 'b'},
         {"either", no_argument, 0, 'e'},
         {"continue", no_argument, 0, 'c'},
+        {"threads", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
-    while ((opt = getopt_long(argc, argv, "psbech", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "psbect:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
-                match_prefix = 1;
-                match_suffix = 0;
-                match_both = 0;
-                match_either = 0;
+                match_prefix = 1; match_suffix = 0; match_both = 0; match_either = 0;
                 break;
             case 's':
-                match_prefix = 0;
-                match_suffix = 1;
-                match_both = 0;
-                match_either = 0;
+                match_prefix = 0; match_suffix = 1; match_both = 0; match_either = 0;
                 break;
             case 'b':
-                match_prefix = 0;
-                match_suffix = 0;
-                match_both = 1;
-                match_either = 0;
+                match_prefix = 0; match_suffix = 0; match_both = 1; match_either = 0;
                 break;
             case 'e':
-                match_prefix = 0;
-                match_suffix = 0;
-                match_both = 0;
-                match_either = 1;
+                match_prefix = 0; match_suffix = 0; match_both = 0; match_either = 1;
                 break;
             case 'c':
                 continue_search = 1;
+                break;
+            case 't':
+                num_threads = atoi(optarg);
+                if (num_threads <= 0) {
+                    fprintf(stderr, "Invalid number of threads: %s\n", optarg);
+                    return 1;
+                }
                 break;
             case 'h':
                 print_usage(argv[0]);
@@ -432,7 +456,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Parse all patterns
+    // Parse patterns (same as before)
     for (int i = 0; i < num_patterns; i++) {
         const char *hex_pattern = argv[optind + i];
         patterns[i].hex_string = strdup(hex_pattern);
@@ -442,7 +466,6 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        // Initialize prefix matching data
         patterns[i].bytes = malloc(32);
         if (!patterns[i].bytes) {
             fprintf(stderr, "Memory allocation failed.\n");
@@ -456,7 +479,6 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        // Initialize suffix matching data
         if (preprocess_suffix_pattern(&patterns[i]) < 0) {
             fprintf(stderr, "Failed to preprocess suffix pattern: %s\n", hex_pattern);
             cleanup_patterns(patterns, i + 1);
@@ -464,39 +486,27 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    unsigned char seed[32];
-    unsigned char public_key[32];
-    unsigned char private_key[64];
-    unsigned long attempts = 0;
-    unsigned long total_matches = 0;
-    int matched_index = -1;
-    int match_type = 0; // 1=prefix, 2=suffix, 3=both, 4=cross-pattern
-    
-    // Timing variables
-    time_t start_time = time(NULL);
-    time_t last_progress_time = start_time;
-    unsigned long last_progress_attempts = 0;
-    
-    // Set up signal handler for Ctrl+C
+    // Set up signal handler
     signal(SIGINT, signal_handler);
     
-    // Print what we're looking for
+    // Print search information
     const char *mode_str;
+    int match_mode;
     if (match_both) {
         mode_str = "both prefix and suffix";
+        match_mode = 3;
     } else if (match_either) {
         mode_str = "prefix OR suffix OR both (including cross-pattern matches)";
+        match_mode = 4;
     } else if (match_suffix) {
         mode_str = "suffix";
+        match_mode = 2;
     } else {
         mode_str = "prefix";
+        match_mode = 1;
     }
     
-    if (continue_search) {
-        printf("Continuously searching for public keys with %s matching one of:\n", mode_str);
-    } else {
-        printf("Looking for public key with %s matching one of:\n", mode_str);
-    }
+    printf("Using %d threads to search for public keys with %s matching one of:\n", num_threads, mode_str);
     for (int i = 0; i < num_patterns; i++) {
         printf("  %s\n", patterns[i].hex_string);
     }
@@ -504,124 +514,66 @@ int main(int argc, char *argv[]) {
         printf("Press Ctrl+C to stop the search.\n\n");
     }
     
-    do {
-        if (!keep_running) break;  // Check if Ctrl+C was pressed
-        
-        randombytes(seed, sizeof(seed));
-        ed25519_create_keypair(public_key, private_key, seed);
-        attempts++;
-        
-        int match = 0;
-        if (match_both) {
-            // Must match both prefix and suffix
-            match = check_multiple_both_match_optimized(public_key, patterns, num_patterns, &matched_index);
-        } else if (match_either) {
-            // Match prefix OR suffix OR both OR cross-pattern
-            match = check_multiple_either_match_optimized(public_key, patterns, num_patterns, &matched_index, &match_type);
-        } else if (match_suffix) {
-            // Match suffix only
-            match = check_multiple_suffix_match_optimized(public_key, patterns, num_patterns, &matched_index);
-        } else {
-            // Match prefix only (default)
-            match = check_multiple_prefix_match(public_key, patterns, num_patterns, &matched_index);
-        }
-        
-        if (match) {
-            total_matches++;
-            time_t current_time = time(NULL);
-            double elapsed_time = difftime(current_time, start_time);
-            
-            printf("\n=== MATCH #%lu found after %lu attempts ===\n", total_matches, attempts);
-            printf("Time elapsed: %.0f seconds\n", elapsed_time);
-            if (elapsed_time > 0) {
-                printf("Overall rate: %.1f attempts/second\n", attempts / elapsed_time);
-            }
-            
-            printf("Matched pattern: %s", patterns[matched_index].hex_string);
-            if (match_either) {
-                switch (match_type) {
-                    case 1:
-                        printf(" (as prefix)");
-                        break;
-                    case 2:
-                        printf(" (as suffix)");
-                        break;
-                    case 3:
-                        printf(" (as both prefix and suffix)");
-                        break;
-                    case 4: {
-                        // For cross-pattern matches, we need to identify which pattern matched as suffix
-                        printf(" (as prefix, with ");
-                        // Find which pattern matched as suffix
-                        for (int k = 0; k < num_patterns; k++) {
-                            if (k != matched_index && check_suffix_match_optimized(public_key, &patterns[k])) {
-                                printf("%s as suffix", patterns[k].hex_string);
-                                break;
-                            }
-                        }
-                        printf(")");
-                        break;
-                    }
-                }
-            }
-            printf("\n");
-            
-            print_hex("Seed", seed, sizeof(seed));
-            print_hex("Public Key", public_key, sizeof(public_key));
-            print_hex("Private Key", private_key, sizeof(private_key));
-            printf("\n");
-            
-            if (!continue_search) break;  // Stop after first match if not in continuous mode
-        }
-        
-        // Print progress every million attempts
-        if (attempts % 1000000 == 0) {
-            time_t current_time = time(NULL);
-            double total_elapsed = difftime(current_time, start_time);
-            double progress_elapsed = difftime(current_time, last_progress_time);
-            unsigned long attempts_since_last = attempts - last_progress_attempts;
-            
-            printf("Attempts: %lu, Matches: %lu", attempts, total_matches);
-            if (total_elapsed > 0) {
-                printf(", Overall: %.1f att/sec", attempts / total_elapsed);
-            }
-            if (progress_elapsed > 0 && attempts_since_last > 0) {
-                printf(", Recent: %.1f att/sec", attempts_since_last / progress_elapsed);
-            }
-            printf("\n");
-            
-            last_progress_time = current_time;
-            last_progress_attempts = attempts;
-        }
-    } while (keep_running);
+    // Create threads
+    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
+    thread_data_t *thread_data = malloc(num_threads * sizeof(thread_data_t));
     
-    if (continue_search) {
-        time_t end_time = time(NULL);
-        double total_elapsed = difftime(end_time, start_time);
-        printf("\n=== SEARCH SUMMARY ===\n");
-        printf("Total attempts: %lu\n", attempts);
-        printf("Total matches found: %lu\n", total_matches);
-        printf("Total time: %.0f seconds\n", total_elapsed);
-        if (total_elapsed > 0) {
-            printf("Average rate: %.1f attempts/second\n", attempts / total_elapsed);
+    start_time = time(NULL);
+    
+    for (int i = 0; i < num_threads; i++) {
+        thread_data[i].thread_id = i;
+        thread_data[i].patterns = patterns;
+        thread_data[i].num_patterns = num_patterns;
+        thread_data[i].match_mode = match_mode;
+        thread_data[i].continue_search = continue_search;
+        
+        if (pthread_create(&threads[i], NULL, worker_thread, &thread_data[i]) != 0) {
+            fprintf(stderr, "Failed to create thread %d\n", i);
+            return 1;
         }
-        if (total_matches > 0) {
-            printf("Average attempts per match: %.1f\n", (double)attempts / total_matches);
-            if (total_elapsed > 0) {
-                printf("Average time per match: %.1f seconds\n", total_elapsed / total_matches);
-            }
+    }
+    
+    // Progress reporting thread
+    while (keep_running && (!match_found || continue_search)) {
+        sleep(10); // Report every 10 seconds
+        
+        pthread_mutex_lock(&stats_mutex);
+        unsigned long current_attempts = total_attempts;
+        unsigned long current_matches = total_matches;
+        pthread_mutex_unlock(&stats_mutex);
+        
+        time_t current_time = time(NULL);
+        double elapsed = difftime(current_time, start_time);
+        
+        if (elapsed > 0) {
+            printf("Progress: %lu attempts, %lu matches, %.1f att/sec (%.1f sec elapsed)\n",
+                   current_attempts, current_matches, current_attempts / elapsed, elapsed);
         }
-    } else if (total_matches == 0) {
-        time_t end_time = time(NULL);
-        double total_elapsed = difftime(end_time, start_time);
-        printf("No matches found after %lu attempts", attempts);
-        if (total_elapsed > 0) {
-            printf(" (%.1f attempts/second)", attempts / total_elapsed);
-        }
-        printf(".\n");
+    }
+    
+    // Wait for all threads to finish
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    // Final statistics
+    time_t end_time = time(NULL);
+    double total_elapsed = difftime(end_time, start_time);
+    
+    printf("\n=== FINAL STATISTICS ===\n");
+    printf("Total attempts: %lu\n", total_attempts);
+    printf("Total matches: %lu\n", total_matches);
+    printf("Total time: %.0f seconds\n", total_elapsed);
+    if (total_elapsed > 0) {
+        printf("Average rate: %.1f attempts/second\n", total_attempts / total_elapsed);
+    }
+    if (total_matches > 0) {
+        printf("Average attempts per match: %.1f\n", (double)total_attempts / total_matches);
     }
     
     // Cleanup
+    free(threads);
+    free(thread_data);
     cleanup_patterns(patterns, num_patterns);
     
     return 0;
