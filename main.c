@@ -94,17 +94,19 @@ typedef struct {
     int num_patterns;
     int match_mode; // 1=prefix, 2=suffix, 3=both, 4=either
     int continue_search;
+    int repeater_mode; // New field for repeater mode
     unsigned long local_attempts;
     unsigned long local_matches;
 } thread_data_t;
 
 // Forward declarations
 int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes, int prefix_len, int half_byte);
+int check_prefix_match_repeater(const unsigned char *public_key, const unsigned char *prefix_bytes, int prefix_len, int half_byte);
 int check_suffix_match_optimized(const unsigned char *public_key, const pattern_t *pattern);
-int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
+int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int repeater_mode);
 int check_multiple_suffix_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
-int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index);
-int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type);
+int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int repeater_mode);
+int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type, int repeater_mode);
 
 // Suffix matching functions (same as before)
 int preprocess_suffix_pattern(pattern_t *pattern) {
@@ -165,7 +167,7 @@ int check_suffix_match_optimized(const unsigned char *public_key, const pattern_
     }
 }
 
-// All the matching functions (same as before)
+// Original prefix matching function
 int check_prefix_match(const unsigned char *public_key, const unsigned char *prefix_bytes,
                       int prefix_len, int half_byte) {
     for (int i = 0; i < prefix_len; i++) {
@@ -182,9 +184,45 @@ int check_prefix_match(const unsigned char *public_key, const unsigned char *pre
     return 1;
 }
 
-int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+// New repeater mode prefix matching function - starts from the second byte (third hex digit)
+int check_prefix_match_repeater(const unsigned char *public_key, const unsigned char *prefix_bytes,
+                               int prefix_len, int half_byte) {
+    // Skip the first byte (first two hex digits) and start matching from the second byte
+    // This effectively shifts the pattern by one byte (two hex digits)
+    
+    if (prefix_len == 0) return 1;
+    
+    // Make sure we have enough bytes in the key to perform the shifted comparison
+    if (prefix_len > 31) { // 32 - 1 for the offset
+        return 0;
+    }
+    
+    // Compare pattern starting from public_key[1] instead of public_key[0]
+    for (int i = 0; i < prefix_len; i++) {
+        if (i == prefix_len - 1 && half_byte) {
+            // Last byte and pattern has odd length - only compare first nibble
+            if ((public_key[i + 1] >> 4) != (prefix_bytes[i] >> 4)) {
+                return 0;
+            }
+        } else {
+            if (public_key[i + 1] != prefix_bytes[i]) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+int check_multiple_prefix_match(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int repeater_mode) {
     for (int i = 0; i < num_patterns; i++) {
-        if (check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte)) {
+        int match;
+        if (repeater_mode) {
+            match = check_prefix_match_repeater(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        } else {
+            match = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        }
+        
+        if (match) {
             *matched_index = i;
             return 1;
         }
@@ -202,10 +240,16 @@ int check_multiple_suffix_match_optimized(const unsigned char *public_key, patte
     return 0;
 }
 
-int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index) {
+int check_multiple_both_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int repeater_mode) {
     for (int i = 0; i < num_patterns; i++) {
-        if (check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte) &&
-            check_suffix_match_optimized(public_key, &patterns[i])) {
+        int prefix_match;
+        if (repeater_mode) {
+            prefix_match = check_prefix_match_repeater(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        } else {
+            prefix_match = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        }
+        
+        if (prefix_match && check_suffix_match_optimized(public_key, &patterns[i])) {
             *matched_index = i;
             return 1;
         }
@@ -213,12 +257,16 @@ int check_multiple_both_match_optimized(const unsigned char *public_key, pattern
     return 0;
 }
 
-int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type) {
+int check_multiple_either_match_optimized(const unsigned char *public_key, pattern_t *patterns, int num_patterns, int *matched_index, int *match_type, int repeater_mode) {
     int prefix_matches[num_patterns];
     int suffix_matches[num_patterns];
     
     for (int i = 0; i < num_patterns; i++) {
-        prefix_matches[i] = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        if (repeater_mode) {
+            prefix_matches[i] = check_prefix_match_repeater(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        } else {
+            prefix_matches[i] = check_prefix_match(public_key, patterns[i].bytes, patterns[i].byte_len, patterns[i].half_byte);
+        }
         suffix_matches[i] = check_suffix_match_optimized(public_key, &patterns[i]);
     }
     
@@ -285,13 +333,13 @@ void* worker_thread(void* arg) {
         
         int match = 0;
         if (data->match_mode == 1) { // prefix
-            match = check_multiple_prefix_match(public_key, data->patterns, data->num_patterns, &matched_index);
+            match = check_multiple_prefix_match(public_key, data->patterns, data->num_patterns, &matched_index, data->repeater_mode);
         } else if (data->match_mode == 2) { // suffix
             match = check_multiple_suffix_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index);
         } else if (data->match_mode == 3) { // both
-            match = check_multiple_both_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index);
+            match = check_multiple_both_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index, data->repeater_mode);
         } else if (data->match_mode == 4) { // either
-            match = check_multiple_either_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index, &match_type);
+            match = check_multiple_either_match_optimized(public_key, data->patterns, data->num_patterns, &matched_index, &match_type, data->repeater_mode);
         }
         
         if (match) {
@@ -313,6 +361,10 @@ void* worker_thread(void* arg) {
             printf("Time elapsed: %.0f seconds\n", elapsed_time);
             
             printf("Matched pattern: %s", data->patterns[matched_index].hex_string);
+            if (data->repeater_mode && (data->match_mode == 1 || data->match_mode == 3 || 
+                (data->match_mode == 4 && (match_type == 1 || match_type == 3 || match_type == 4)))) {
+                printf(" (repeater mode - offset by 2 hex digits)");
+            }
             if (data->match_mode == 4) { // either mode
                 switch (match_type) {
                     case 1:
@@ -385,9 +437,14 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  -s, --suffix    Match pattern as suffix\n");
     fprintf(stderr, "  -b, --both      Match pattern as both prefix and suffix\n");
     fprintf(stderr, "  -e, --either    Match pattern as prefix OR suffix OR both\n");
+    fprintf(stderr, "  -r, --repeater  Enable repeater mode (offset prefix matching by 2 hex digits)\n");
     fprintf(stderr, "  -c, --continue  Keep finding matches until Ctrl+C (don't stop at first)\n");
     fprintf(stderr, "  -t, --threads   Number of threads to use (default: number of CPU cores)\n");
     fprintf(stderr, "  -h, --help      Show this help message\n");
+    fprintf(stderr, "\nRepeater mode:\n");
+    fprintf(stderr, "  When enabled, prefix matching starts from the 3rd hex digit (2nd byte)\n");
+    fprintf(stderr, "  Example: searching for 'deadbeef' will match 'XXdeadbeef...'\n");
+    fprintf(stderr, "  Affects prefix matching in -p, -b, and -e modes\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -396,6 +453,7 @@ int main(int argc, char *argv[]) {
     int match_both = 0;
     int match_either = 0;
     int continue_search = 0;
+    int repeater_mode = 0; // New variable for repeater mode
     int num_threads = sysconf(_SC_NPROCESSORS_ONLN); // Default to number of CPU cores
     int opt;
     
@@ -404,13 +462,14 @@ int main(int argc, char *argv[]) {
         {"suffix", no_argument, 0, 's'},
         {"both", no_argument, 0, 'b'},
         {"either", no_argument, 0, 'e'},
+        {"repeater", no_argument, 0, 'r'},
         {"continue", no_argument, 0, 'c'},
         {"threads", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
-    while ((opt = getopt_long(argc, argv, "psbect:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "psberct:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 match_prefix = 1; match_suffix = 0; match_both = 0; match_either = 0;
@@ -423,6 +482,9 @@ int main(int argc, char *argv[]) {
                 break;
             case 'e':
                 match_prefix = 0; match_suffix = 0; match_both = 0; match_either = 1;
+                break;
+            case 'r':
+                repeater_mode = 1;
                 break;
             case 'c':
                 continue_search = 1;
@@ -441,6 +503,11 @@ int main(int argc, char *argv[]) {
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+    
+    // Validate repeater mode usage
+    if (repeater_mode && match_suffix) {
+        fprintf(stderr, "Warning: Repeater mode has no effect in suffix-only mode.\n");
     }
     
     if (optind >= argc) {
@@ -508,7 +575,11 @@ int main(int argc, char *argv[]) {
     
     printf("Using %d threads to search for public keys with %s matching one of:\n", num_threads, mode_str);
     for (int i = 0; i < num_patterns; i++) {
-        printf("  %s\n", patterns[i].hex_string);
+        printf("  %s", patterns[i].hex_string);
+        if (repeater_mode && match_mode != 2) {
+            printf(" (repeater mode: offset by 2 hex digits)");
+        }
+        printf("\n");
     }
     if (continue_search) {
         printf("Press Ctrl+C to stop the search.\n\n");
@@ -526,6 +597,7 @@ int main(int argc, char *argv[]) {
         thread_data[i].num_patterns = num_patterns;
         thread_data[i].match_mode = match_mode;
         thread_data[i].continue_search = continue_search;
+        thread_data[i].repeater_mode = repeater_mode;
         
         if (pthread_create(&threads[i], NULL, worker_thread, &thread_data[i]) != 0) {
             fprintf(stderr, "Failed to create thread %d\n", i);
