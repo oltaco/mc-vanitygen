@@ -10,6 +10,10 @@
 #include <unistd.h>
 #include "ed25519.h"
 
+// Version information
+#define MC_VANITYGEN_VERSION "1.0"
+#define MC_VANITYGEN_NAME "mc-vanitygen"
+
 // Global variables for thread coordination
 volatile sig_atomic_t keep_running = 1;
 volatile sig_atomic_t match_found = 0;
@@ -431,6 +435,7 @@ void cleanup_patterns(pattern_t *patterns, int num_patterns) {
 }
 
 void print_usage(const char *prog_name) {
+    fprintf(stderr, "%s v%s\n", MC_VANITYGEN_NAME, MC_VANITYGEN_VERSION);
     fprintf(stderr, "Usage: %s [OPTIONS] <hex_pattern1> [hex_pattern2] ...\n", prog_name);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -p, --prefix    Match pattern as prefix (default)\n");
@@ -445,6 +450,11 @@ void print_usage(const char *prog_name) {
     fprintf(stderr, "  When enabled, prefix matching starts from the 3rd hex digit (2nd byte)\n");
     fprintf(stderr, "  Example: searching for 'deadbeef' will match 'XXdeadbeef...'\n");
     fprintf(stderr, "  Affects prefix matching in -p, -b, and -e modes\n");
+}
+
+void print_version_banner() {
+    printf("%s v%s\n", MC_VANITYGEN_NAME, MC_VANITYGEN_VERSION);
+    printf("MeshCore Vanity Key Generator\n\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -515,6 +525,9 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         return 1;
     }
+    
+    // Print version banner
+    print_version_banner();
     
     int num_patterns = argc - optind;
     pattern_t *patterns = malloc(num_patterns * sizeof(pattern_t));
